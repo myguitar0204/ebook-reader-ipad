@@ -1,0 +1,7 @@
+.playwright-mcp/
+__pycache__/
+# 書不放進 repo（repo 公開）
+*.epub
+*.kepub
+*.pdf
+*.txt

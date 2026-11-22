@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>我的書庫</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="書庫">
+<meta name="theme-color" content="#f6f4ef">
+<script src="vendor/jszip.min.js"></script>
+<script src="vendor/pdf.min.js"></script>
+<script src="db.js"></script>
+<style>
+  :root { --bg:#f6f4ef; --card:#fff; --ink:#2b2b2b; --muted:#777; --accent:#8a5a2b; --line:#e2ddd3; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin:0; font-family: "PingFang TC", "Microsoft JhengHei", system-ui, sans-serif; background:var(--bg); color:var(--ink);
+         padding: 0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  header { position:sticky; top:0; z-index:5; background:var(--bg); border-bottom:1px solid var(--line);
+           padding:calc(12px + env(safe-area-inset-top)) 20px 12px; display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  h1 { font-size:20px; margin:0 12px 0 0; }
+  input[type=search], select { padding:9px 10px; border:1px solid var(--line); border-radius:8px; font:inherit; font-size:16px; background:#fff; color:inherit; }
+  input[type=search] { flex:1; min-width:180px; }
+  button { padding:9px 14px; border:1px solid var(--line); border-radius:8px; background:#fff; font:inherit; color:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #tagbar { padding:10px 20px 0; display:flex; flex-wrap:wrap; gap:6px; }
+  .chip { padding:5px 12px; border-radius:999px; border:1px solid var(--line); background:#fff; font-size:14px; cursor:pointer; }
+  .chip.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+  #status, #storage { padding:8px 20px 0; color:var(--muted); font-size:13px; }
+  #storage { padding-top:2px; font-size:12px; }
+  #grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:18px; padding:16px 20px 40px; }
+  .card { background:var(--card); border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,.08); overflow:hidden; display:flex; flex-direction:column; }
+  .cover { aspect-ratio:2/3; background:#ddd5c6; display:flex; align-items:center; justify-content:center; cursor:pointer; position:relative; }
+  .cover img { width:100%; height:100%; object-fit:cover; }
+  .cover .ph { padding:10px; text-align:center; color:#5b4a35; font-size:14px; word-break:break-all; }
+  .badge { position:absolute; top:6px; left:6px; background:rgba(0,0,0,.6); color:#fff; font-size:11px; padding:1px 6px; border-radius:4px; text-transform:uppercase; }
+  .bar { height:4px; background:#eee; } .bar > div { height:100%; background:var(--accent); }
+  .info { padding:8px; font-size:13px; flex:1; display:flex; flex-direction:column; gap:4px; }
+  .fname { font-weight:bold; word-break:break-all; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
+  .sub { color:var(--muted); font-size:12px; }
+  .tags span { display:inline-block; background:#f1ebe0; border-radius:4px; padding:0 5px; margin:1px 2px 0 0; font-size:11px; }
+  .actions { display:flex; gap:4px; margin-top:auto; padding-top:4px; }
+  .actions button { flex:1; padding:6px 3px; font-size:13px; }
+  .empty { grid-column:1/-1; text-align:center; color:var(--muted); line-height:2; padding:40px 0; }
+  dialog { border:none; border-radius:12px; padding:20px; width:min(520px, 92vw); }
+  dialog h2 { margin-top:0; font-size:17px; }
+  dialog input[type=text] { width:100%; padding:9px; font:inherit; font-size:16px; border:1px solid var(--line); border-radius:8px; }
+  .row { display:flex; gap:8px; margin-top:10px; justify-content:flex-end; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📚 我的書庫</h1>
+  <input type="search" id="q" placeholder="搜尋檔名、書名、作者…">
+  <select id="fmt">
+    <option value="">全部格式</option>
+    <option value="epub">EPUB</option>
+    <option value="pdf">PDF</option>
+    <option value="txt">TXT</option>
+  </select>
+  <select id="sort">
+    <option value="recent">最近閱讀</option>
+    <option value="filename">檔名</option>
+    <option value="title">書名</option>
+    <option value="added">加入時間</option>
+    <option value="progress">閱讀進度</option>
+  </select>
+  <button id="btnImport" class="primary">匯入</button>
+  <input type="file" id="file" multiple accept=".epub,.kepub,.pdf,.txt" hidden>
+</header>
+<div id="tagbar"></div>
+<div id="status"></div>
+<div id="storage"></div>
+<div id="grid"></div>
+
+<dialog id="dlgTags">
+  <h2>編輯標籤</h2>
+  <p class="sub" id="tagBookName"></p>
+  <input type="text" id="tagInput" placeholder="以逗號分隔，例如：小說, 推理">
+  <div class="row"><button id="btnSaveTags" class="primary">儲存</button><button onclick="dlgTags.close()">取消</button></div>
+</dialog>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+let books = [], activeTag = null, editingId = null, coverUrls = new Map();
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js");
+pdfjsLib.GlobalWorkerOptions.workerSrc = "vendor/pdf.worker.min.js";
+
+async function load() {
+  books = await DB.list();
+  // 封面 Blob 轉成網址；只為新出現的書建立，刪除的書釋放
+  for (const b of books) if (b.has_cover && !coverUrls.has(b.id)) {
+    const blob = await DB.cover(b.id);
+    if (blob) coverUrls.set(b.id, URL.createObjectURL(blob));
+  }
+  for (const [id, url] of coverUrls) if (!books.some(b => b.id === id)) { URL.revokeObjectURL(url); coverUrls.delete(id); }
+  render();
+}
+
+async function storageText() {
+  try {
+    const { usage, quota } = await navigator.storage.estimate();
+    return `iPad 儲存：已用 ${(usage / 2 ** 20).toFixed(0)} MB／上限 ${(quota / 2 ** 30).toFixed(1)} GB`;
+  } catch { return ""; }
+}
+
+function render() {
+  const allTags = [...new Set(books.flatMap(b => b.tags))].sort();
+  if (activeTag && !allTags.includes(activeTag)) activeTag = null;
+  $("#tagbar").innerHTML = allTags.length
+    ? [`<span class="chip ${activeTag ? "" : "on"}" data-tag="">全部</span>`,
+       ...allTags.map(t => `<span class="chip ${t === activeTag ? "on" : ""}" data-tag="${esc(t)}">${esc(t)}</span>`)].join("")
+    : "";
+
+  const q = $("#q").value.trim().toLowerCase();
+  const fmt = $("#fmt").value;
+  const list = books.filter(b =>
+    (!fmt || b.fmt === fmt) &&
+    (!activeTag || b.tags.includes(activeTag)) &&
+    (!q || [b.filename, b.title, b.author].some(s => (s || "").toLowerCase().includes(q))));
+
+  const cmp = {
+    recent: (a, b) => (b.last_read || 0) - (a.last_read || 0) || a.filename.localeCompare(b.filename, "zh-Hant"),
+    filename: (a, b) => a.filename.localeCompare(b.filename, "zh-Hant"),
+    title: (a, b) => (a.title || a.filename).localeCompare(b.title || b.filename, "zh-Hant"),
+    added: (a, b) => b.added_at - a.added_at,
+    progress: (a, b) => b.progress - a.progress,
+  }[$("#sort").value];
+  list.sort(cmp);
+
+  $("#status").textContent = `共 ${list.length} 本` + (list.length !== books.length ? `（書庫總計 ${books.length} 本）` : "");
+  storageText().then(t => { $("#storage").textContent = t; });
+  if (!books.length) {
+    $("#grid").innerHTML = `<div class="empty">書庫是空的<br>先把電子書放到「檔案」App（iCloud 雲碟或「我的 iPad」），<br>再按右上角「匯入」選取（可多選）。</div>`;
+    return;
+  }
+  $("#grid").innerHTML = list.map(b => {
+    const pct = Math.round(b.progress * 100);
+    const state = !b.last_read ? "未讀" : pct >= 99 ? "已讀完" : `已讀 ${pct}%`;
+    const url = coverUrls.get(b.id);
+    return `<div class="card">
+      <div class="cover" data-open="${b.id}" title="${esc(b.filename)}">
+        ${url ? `<img loading="lazy" src="${url}" alt="">` : `<div class="ph">${esc(b.title || b.filename)}</div>`}
+        <span class="badge">${b.fmt}</span>
+      </div>
+      <div class="bar"><div style="width:${pct}%"></div></div>
+      <div class="info">
+        <div class="fname">${esc(b.title || b.filename)}</div>
+        ${b.author ? `<div class="sub">${esc(b.author)}</div>` : ""}
+        <div class="sub">${state}</div>
+        <div class="tags">${b.tags.map(t => `<span>${esc(t)}</span>`).join("")}</div>
+        <div class="actions"><button data-tags="${b.id}">標籤</button><button data-remove="${b.id}">刪除</button></div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+$("#tagbar").onclick = e => { const t = e.target.dataset.tag; if (t !== undefined) { activeTag = t || null; render(); } };
+$("#q").oninput = render;
+$("#sort").onchange = () => { localStorage.setItem("sort", $("#sort").value); render(); };
+try { $("#sort").value = localStorage.getItem("sort") || "recent"; } catch {}
+$("#fmt").onchange = () => { localStorage.setItem("fmt", $("#fmt").value); render(); };
+try { $("#fmt").value = localStorage.getItem("fmt") || ""; } catch {}
+
+$("#grid").onclick = async e => {
+  const el = e.target.closest("[data-open],[data-tags],[data-remove]");
+  if (!el) return;
+  if (el.dataset.open) location.href = `reader.html?id=${el.dataset.open}`;
+  if (el.dataset.tags) {
+    const b = books.find(x => x.id == el.dataset.tags);
+    editingId = b.id;
+    $("#tagBookName").textContent = b.title || b.filename;
+    $("#tagInput").value = b.tags.join(", ");
+    dlgTags.showModal();
+  }
+  if (el.dataset.remove) {
+    const b = books.find(x => x.id == el.dataset.remove);
+    if (!confirm(`從 iPad 刪除「${b.title || b.filename}」？\n（書檔與閱讀進度都會刪除，「檔案」App 裡的原始檔不受影響）`)) return;
+    await DB.remove(b.id);
+    load();
+  }
+};
+
+$("#btnSaveTags").onclick = async () => {
+  const tags = [...new Set($("#tagInput").value.split(/[,，]/).map(s => s.trim()).filter(Boolean))].sort();
+  await DB.update(editingId, { tags });
+  dlgTags.close();
+  load();
+};
+
+$("#btnImport").onclick = () => $("#file").click();
+$("#file").onchange = async () => {
+  const files = [...$("#file").files];
+  $("#file").value = "";
+  if (!files.length) return;
+  navigator.storage?.persist?.();  // 要求瀏覽器不要在空間不足時自動清掉書庫
+  $("#btnImport").disabled = true;
+  try {
+    const r = await importFiles(files, (i, n, name) => { $("#status").textContent = `匯入中 ${i}/${n}：${name}`; });
+    await load();
+    let msg = `　｜　新增 ${r.added} 本`;
+    if (r.skipped.length) msg += `，略過 ${r.skipped.length} 本`;
+    if (r.failed.length) msg += `，失敗 ${r.failed.length} 本`;
+    $("#status").textContent += msg;
+    if (r.failed.length) alert("以下檔案匯入失敗：\n" + r.failed.join("\n"));
+  } finally {
+    $("#btnImport").disabled = false;
+  }
+};
+
+load();
+</script>
+</body>
+</html>

@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>閱讀</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#f6f4ef">
+<!-- 函式庫放在本機（離線也能用）：jszip 3.10.1、epubjs 0.3.93、pdf.js 3.11.174 -->
+<script src="vendor/jszip.min.js"></script>
+<script src="vendor/epub.min.js"></script>
+<script src="vendor/pdf.min.js"></script>
+<script src="db.js"></script>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  [hidden] { display:none !important; }
+  html, body { margin:0; height:100%; }
+  body { display:flex; flex-direction:column; font-family:"PingFang TC", "Microsoft JhengHei", system-ui, sans-serif; background:#f6f4ef; color:#2b2b2b;
+         padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  #top { display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid #e2ddd3; flex-wrap:wrap; }
+  #top a { text-decoration:none; color:#8a5a2b; padding:6px 4px; }
+  #name { flex:1; min-width:120px; font-weight:bold; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  button, select { padding:7px 11px; border:1px solid #e2ddd3; border-radius:8px; background:#fff; font:inherit; color:inherit; cursor:pointer; touch-action:manipulation; }
+  select { max-width:220px; }
+  #fs, #mg { min-width:46px; text-align:center; font-size:13px; }
+  #pct { font-size:13px; color:#777; min-width:60px; text-align:right; }
+  #main { flex:1; position:relative; overflow:hidden; }
+  #main { --mg:0; --nav:40px; }  /* 左右空白：每側額外留白的百分比，0 為原本版面 */
+  @media (pointer: coarse) { #main { --nav:56px; } }  /* 觸控時翻頁按鈕加寬，手指比較好點 */
+  #epub { position:absolute; inset:0 calc(var(--nav) + var(--mg) * 1%); }
+  #pdf, #txt { position:absolute; inset:0; overflow:auto; -webkit-overflow-scrolling:touch; }
+  #pdf { text-align:center; background:#e8e4dc; padding:12px 0; scrollbar-gutter:stable; }  /* 翻頁動畫暫時隱藏捲軸時，版面寬度不跳動 */
+  #pdf canvas { box-shadow:0 1px 4px rgba(0,0,0,.2); background:#fff; }
+  #txt pre { white-space:pre-wrap; word-break:break-word; font-family:inherit; line-height:1.8; max-width:calc(min(46em, 100%) * (100 - 2 * var(--mg)) / 100); margin:0 auto; padding:24px; }
+  .nav { position:absolute; top:0; bottom:0; width:var(--nav); border:none; background:transparent; font-size:26px; color:#aaa; border-radius:0; z-index:2; }
+  @media (hover: hover) { .nav:hover { background:rgba(0,0,0,.04); color:#8a5a2b; } }
+  .nav:active { background:rgba(0,0,0,.05); }
+  #left { left:0; } #right { right:0; }
+  #msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#777; padding:20px; text-align:center; }
+  #chapter { text-align:center; font-size:13px; color:#8a5a2b; padding:4px 48px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+</style>
+</head>
+<body>
+<div id="top">
+  <a href="index.html">← 書庫</a>
+  <span id="name"></span>
+  <select id="toc" hidden></select>
+  <button id="dir" title="切換翻頁方向" hidden></button>
+  <button id="smaller" title="縮小">A−</button><span id="fs"></span><button id="bigger" title="放大">A＋</button>
+  <span id="mgBox" hidden><button id="mgLess" title="左右空白減少">空白−</button><span id="mg"></span><button id="mgMore" title="左右空白增加，文字往中間集中">空白＋</button></span>
+  <span id="pct"></span>
+</div>
+<div id="chapter" hidden></div>
+<div id="main">
+  <div id="msg">載入中…</div>
+  <div id="epub" hidden></div>
+  <div id="pdf" hidden><canvas id="canvas"></canvas></div>
+  <div id="txt" hidden><pre></pre></div>
+  <button class="nav" id="left" hidden>‹</button>
+  <button class="nav" id="right" hidden>›</button>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const id = Number(new URLSearchParams(location.search).get("id"));
+const store = {
+  get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+// 進度：每次變動延遲 0.5 秒存檔，離開或切到背景時立即寫入
+let pending = null, timer = null;
+function saveProgress(position, progress) {
+  pending = { position: String(position), progress: Math.max(0, Math.min(1, progress)) };
+  $("#pct").textContent = (progress * 100).toFixed(1) + "%";
+  clearTimeout(timer);
+  timer = setTimeout(flush, 500);
+}
+function flush() {
+  if (!pending) return;
+  DB.update(id, { ...pending, last_read: Date.now() });
+  pending = null;
+}
+addEventListener("pagehide", flush);
+document.addEventListener("visibilitychange", () => { if (document.hidden) flush(); });  // iPad 切 App 時不一定有 pagehide
+
+// 字體大小：EPUB / txt 為文字百分比，PDF 為頁面縮放百分比
+let reader;
+function setupSize(key, def, step, min, max, apply) {
+  let v = store.get(key, def);
+  const show = () => { $("#fs").textContent = v + "%"; };
+  const change = d => { v = Math.min(max, Math.max(min, v + d)); store.set(key, v); show(); apply(v); };
+  $("#smaller").onclick = () => change(-step);
+  $("#bigger").onclick = () => change(step);
+  show();
+  return v;
+}
+
+// 左右空白（EPUB / txt 共用）：每側額外留白占版面寬度的百分比，0 為原本版面
+function setupMargin(apply) {
+  let v = store.get("margin-text", 0);
+  const set = () => { $("#mg").textContent = v + "%"; $("#main").style.setProperty("--mg", v); };
+  const change = d => { v = Math.min(30, Math.max(0, v + d)); store.set("margin-text", v); apply(set); };  // apply 先記下閱讀位置再呼叫 set 改版面
+  $("#mgLess").onclick = () => change(-3);
+  $("#mgMore").onclick = () => change(3);
+  $("#mgBox").hidden = false;
+  set();
+}
+
+// 目前章節：chapters 依閱讀順序排列，pos 為 EPUB 的 spine index 或 PDF 的頁碼
+let chapters = [];
+function showChapter(pos) {
+  const c = chapters.find(c => c.pos === pos) || chapters.filter(c => c.pos < pos).pop();
+  $("#chapter").textContent = c?.label || "";
+  $("#chapter").hidden = !c;
+}
+
+function showPane(sel) {
+  $("#msg").hidden = true;
+  $(sel).hidden = false;
+}
+
+// ---------- EPUB ----------
+// 有些直排書只在 <body> 設 writing-mode，epub.js 只看 <html> 而誤判成橫排，
+// 整章被壓成一頁（其餘內容被裁掉），翻一次就跳到下一章；改把直排設定提到 <html>
+const htmlWritingMode = ePub.Contents.prototype.writingMode;
+ePub.Contents.prototype.writingMode = function (mode) {
+  if (!mode && this.document?.body) {
+    const body = this.window.getComputedStyle(this.document.body).writingMode;
+    if (body.startsWith("vertical") && !htmlWritingMode.call(this).startsWith("vertical")) mode = body;
+  }
+  return htmlWritingMode.call(this, mode);
+};
+
+async function openEpub(book, blob) {
+  const ebook = ePub(await blob.arrayBuffer());
+  showPane("#epub");
+  let rendition;
+  setupMargin(set => {  // epub.js 只在視窗縮放時重新排版，容器變寬窄後要手動 resize
+    const cfi = rendition.currentLocation()?.start?.cfi;
+    set();
+    rendition.resize();
+    if (cfi) rendition.display(cfi);
+  });
+  rendition = ebook.renderTo("epub", { width: "100%", height: "100%", flow: "paginated", spread: "none" });
+  const fs = setupSize("fs-text", 100, 10, 50, 300, v => {
+    const cfi = rendition.currentLocation()?.start?.cfi;
+    rendition.themes.fontSize(v + "%");
+    if (cfi) rendition.display(cfi);
+  });
+  rendition.themes.fontSize(fs + "%");
+
+  // 百分比需要 locations；生成較慢，結果存在書的資料裡（localStorage 容量不夠放上百本）
+  let locReady = false;
+  const pct = cfi => locReady ? ebook.locations.percentageFromCfi(cfi) : book.progress;
+  rendition.on("relocated", loc => {
+    saveProgress(loc.start.cfi, loc.atEnd ? 1 : pct(loc.start.cfi));
+    showChapter(loc.start.index);
+  });
+
+  await rendition.display(book.position || undefined);
+  reader = {
+    prev: () => rendition.prev(), next: () => rendition.next(),
+    page: $("#epub"),
+    atEdge: forward => !!rendition.currentLocation()?.[forward ? "atEnd" : "atStart"],
+  };
+  rendition.on("keyup", onKey);
+  // 書頁在 iframe 裡，觸控事件不會冒泡到外層，要從 rendition 轉接
+  rendition.on("touchstart", swipeStart);
+  rendition.on("touchend", swipeEnd);
+  setupDir(ebook.package.metadata.direction === "rtl");
+  $("#left").hidden = $("#right").hidden = false;
+
+  ebook.loaded.navigation.then(nav => {
+    const opts = [];
+    // 目錄的 href 相對於 nav 檔，與 spine 的 href 基準可能不同，找不到時改比對結尾路徑
+    const spineIndex = href => {
+      const h = href.split("#")[0];
+      return (ebook.spine.get(h) || ebook.spine.spineItems.find(s => s.href.endsWith(h.replace(/^(\.\.\/)+/, ""))))?.index;
+    };
+    const walk = (items, depth) => items.forEach(i => {
+      opts.push(`<option value="${i.href}">${"　".repeat(depth)}${i.label.trim().replace(/</g, "&lt;")}</option>`);
+      const pos = spineIndex(i.href);
+      if (pos !== undefined) chapters.push({ label: i.label.trim(), pos });
+      if (i.subitems?.length) walk(i.subitems, depth + 1);
+    });
+    walk(nav.toc, 0);
+    chapters.sort((a, b) => a.pos - b.pos);
+    const cur = rendition.currentLocation();
+    if (cur?.start) showChapter(cur.start.index);
+    if (!opts.length) return;
+    $("#toc").innerHTML = `<option value="">目錄</option>` + opts.join("");
+    $("#toc").hidden = false;
+    $("#toc").onchange = e => { if (e.target.value) rendition.display(e.target.value); e.target.value = ""; };
+  });
+
+  if (book.locations) ebook.locations.load(book.locations);
+  else { await ebook.locations.generate(1600); DB.update(id, { locations: ebook.locations.save() }); }
+  locReady = true;
+  const cur = rendition.currentLocation();
+  if (cur?.start) $("#pct").textContent = (pct(cur.start.cfi) * 100).toFixed(1) + "%";
+}
+
+// ---------- PDF ----------
+async function openPdf(book, blob) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "vendor/pdf.worker.min.js";
+  // 未嵌入字型的中日韓 PDF 需要 CMap 才能顯示文字
+  const doc = await pdfjsLib.getDocument({ data: await blob.arrayBuffer(), cMapUrl: "vendor/cmaps/", cMapPacked: true }).promise;
+  showPane("#pdf");
+  const canvas = $("#canvas"), box = $("#pdf");
+  let page = Math.min(doc.numPages, Math.max(1, parseInt(book.position) || 1));
+  let zoom = setupSize("fs-pdf", 100, 10, 30, 400, v => { zoom = v; draw(); });
+  let task = null;
+
+  async function draw() {
+    const p = await doc.getPage(page);
+    const base = p.getViewport({ scale: 1 });
+    const scale = (box.clientWidth - 40) / base.width * zoom / 100;
+    const vp = p.getViewport({ scale: scale * devicePixelRatio });
+    canvas.width = vp.width; canvas.height = vp.height;
+    canvas.style.width = vp.width / devicePixelRatio + "px";
+    task?.cancel();
+    task = p.render({ canvasContext: canvas.getContext("2d"), viewport: vp });
+    try { await task.promise; } catch { /* 被新的繪製取消 */ }
+  }
+  const sel = $("#toc");
+  sel.innerHTML = Array.from({ length: doc.numPages }, (_, i) => `<option value="${i + 1}">第 ${i + 1} / ${doc.numPages} 頁</option>`).join("");
+  sel.hidden = false;
+  sel.onchange = e => go(+e.target.value);
+
+  function go(n) {
+    if (n < 1 || n > doc.numPages) return;
+    page = n; sel.value = page; box.scrollTop = 0;
+    const drawn = draw();
+    showChapter(page);
+    saveProgress(page, doc.numPages === 1 ? 1 : (page - 1) / (doc.numPages - 1));
+    return drawn;
+  }
+  reader = {
+    prev: () => go(page - 1), next: () => go(page + 1),
+    page: canvas,
+    atEdge: forward => forward ? page >= doc.numPages : page <= 1,
+    // 放大到可以左右捲動時，左右滑動是在移動頁面，不翻頁
+    canSwipe: () => box.scrollWidth <= box.clientWidth + 1,
+  };
+  setupDir(false);
+  box.addEventListener("touchstart", swipeStart, { passive: true });
+  box.addEventListener("touchend", swipeEnd);
+
+  $("#left").hidden = $("#right").hidden = false;
+  addEventListener("resize", draw);
+  go(page);
+
+  // PDF 書籤：目的地可能是具名目的地或頁面參照，統一換算成頁碼
+  const destPage = async dest => {
+    if (typeof dest === "string") dest = await doc.getDestination(dest);
+    if (!Array.isArray(dest)) return undefined;
+    return typeof dest[0] === "number" ? dest[0] + 1 : (await doc.getPageIndex(dest[0])) + 1;
+  };
+  const flat = [];
+  const walk = items => (items || []).forEach(i => { flat.push(i); walk(i.items); });
+  walk(await doc.getOutline());
+  const resolved = await Promise.all(flat.map(async i => ({ label: i.title.trim(), pos: await destPage(i.dest).catch(() => undefined) })));
+  chapters = resolved.filter(c => c.pos !== undefined).sort((a, b) => a.pos - b.pos);
+  showChapter(page);
+}
+
+// ---------- TXT ----------
+async function openTxt(book, blob) {
+  const text = decodeTxt(await blob.arrayBuffer());
+  const box = $("#txt"), pre = box.querySelector("pre");
+  pre.textContent = text;
+  showPane("#txt");
+  const ratio = () => box.scrollTop / Math.max(1, box.scrollHeight - box.clientHeight);
+  const fs = setupSize("fs-text", 100, 10, 50, 300, v => {
+    const r = ratio();
+    pre.style.fontSize = v + "%";
+    box.scrollTop = r * (box.scrollHeight - box.clientHeight);
+  });
+  pre.style.fontSize = fs + "%";
+  setupMargin(set => {
+    const r = ratio();
+    set();
+    box.scrollTop = r * (box.scrollHeight - box.clientHeight);
+  });
+  box.scrollTop = (parseFloat(book.position) || 0) * (box.scrollHeight - box.clientHeight);
+  box.onscroll = () => { const r = ratio(); saveProgress(r.toFixed(6), r); };
+  reader = {
+    prev: () => box.scrollBy({ top: -(box.clientHeight - 40) }),
+    next: () => box.scrollBy({ top: box.clientHeight - 40 }),
+  };
+}
+
+// 翻頁方向：leftNext 為 true 表示往左是下一頁（直排書）；每本書各自記住
+let leftNext = false;
+function setupDir(def) {
+  leftNext = store.get(`dir-${id}`, def);
+  const show = () => { $("#dir").textContent = leftNext ? "← 向左翻頁" : "向右翻頁 →"; };
+  $("#dir").onclick = () => { leftNext = !leftNext; store.set(`dir-${id}`, leftNext); show(); };
+  $("#dir").hidden = false;
+  show();
+}
+// 翻頁動畫：往後翻時目前頁沿書脊翻走，往前翻時前一頁從書脊翻回來。
+// 換頁（epub.js / pdf.js 的繪製）一定在兩段動畫之間完成，不能放進 View Transition 的
+// callback：瀏覽器在 callback 期間暫停畫面更新，兩者的繪製都要等畫面更新才會完成，會互卡到逾時。
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+let turning = Promise.resolve();
+function turn(forward) {
+  turning = turning.then(() => animateTurn(forward)).catch(console.error);  // 連按時依序播放，不重疊
+}
+async function animateTurn(forward) {
+  const act = () => forward ? reader.next() : reader.prev();
+  const el = reader.page;
+  if (!el || reduceMotion || reader.atEdge(forward)) return act();
+  // 頁面外緣往使用者這邊掀起再翻過書脊，像真的翻書。透視距離取頁寬的 2.5 倍：
+  // 小於頁寬時外緣會穿過視點而畫面錯亂；掀起時頁面會放大，動畫期間外層要裁切，不能撐出捲軸
+  const persp = `perspective(${Math.round(el.offsetWidth * 2.5)}px)`;
+  const flat = { transform: `${persp} rotateY(0deg)`, filter: "brightness(1)" };
+  const away = { transform: `${persp} rotateY(${leftNext ? 90 : -90}deg)`, filter: "brightness(.6)" };
+  el.style.transformOrigin = (leftNext ? "right" : "left") + " center";  // 書脊那一側
+  const box = el.parentElement;
+  box.style.overflow = "hidden";
+  try { await playTurn(el, forward, act, flat, away); } finally { box.style.overflow = ""; }
+}
+async function playTurn(el, forward, act, flat, away) {
+  if (forward) {
+    const out = el.animate([flat, away], { duration: 260, easing: "ease-in", fill: "forwards" });
+    await out.finished;
+    await act();
+    out.cancel();
+    await el.animate([{ opacity: .3 }, { opacity: 1 }], { duration: 140 }).finished;
+  } else {
+    const fade = el.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 100, fill: "forwards" });
+    await fade.finished;
+    await act();
+    const back = el.animate([away, flat], { duration: 300, easing: "ease-out", fill: "backwards" });
+    fade.cancel();
+    await back.finished;
+  }
+}
+const goLeft = () => turn(leftNext);
+const goRight = () => turn(!leftNext);
+
+// 滑動翻頁：手指往左滑等同按右邊（看右邊那一頁），往右滑等同按左邊。
+// 用 screenX 而不是 clientX：EPUB 的觸控來自 iframe，clientX 的座標基準和外層不同
+let swipe = null;
+function swipeStart(e) {
+  const t = e.changedTouches[0];
+  swipe = e.touches.length === 1 ? { x: t.screenX, y: t.screenY, time: Date.now() } : null;
+}
+function swipeEnd(e) {
+  if (!swipe || !reader) return;
+  const t = e.changedTouches[0];
+  const dx = t.screenX - swipe.x, dy = t.screenY - swipe.y;
+  const quick = Date.now() - swipe.time < 800;
+  swipe = null;
+  if (!quick || Math.abs(dx) < 50 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+  if (reader.canSwipe && !reader.canSwipe()) return;
+  dx < 0 ? goRight() : goLeft();
+}
+
+function onKey(e) {
+  if (!reader) return;
+  if (e.key === "ArrowLeft") goLeft();
+  if (e.key === "ArrowRight") goRight();
+  if (e.key === "PageUp") turn(false);
+  if (e.key === "PageDown" || e.key === " ") { e.preventDefault?.(); turn(true); }
+}
+document.addEventListener("keydown", onKey);
+$("#left").onclick = () => reader && goLeft();
+$("#right").onclick = () => reader && goRight();
+
+(async () => {
+  try {
+    const book = await DB.get(id);
+    const blob = book && await DB.file(id);
+    if (!blob) throw new Error("書庫裡找不到這本書");
+    document.title = book.title || book.filename;
+    $("#name").textContent = book.title || book.filename;
+    await ({ epub: openEpub, pdf: openPdf, txt: openTxt })[book.fmt](book, blob);
+  } catch (err) {
+    $("#msg").hidden = false;
+    $("#msg").textContent = "開啟失敗：" + err.message;
+    console.error(err);
+  }
+})();
+</script>
+</body>
+</html>
